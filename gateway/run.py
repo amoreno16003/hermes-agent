@@ -1357,6 +1357,8 @@ _PORT_BINDING_PLATFORM_VALUES = frozenset({
     "wecom_callback",
     "bluebubbles",
     "sms",
+    "whatsapp_cloud",
+    "line",
 })
 
 
