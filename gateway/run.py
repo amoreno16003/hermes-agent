@@ -24125,7 +24125,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # primary folder instead of the gateway-global TERMINAL_CWD. Registered
         # per-session rather than mutating os.environ, so concurrent sessions in
         # different project channels don't clobber each other's cwd.
-        if source.platform == Platform.DISCORD and session_id:
+        #
+        # NB: compare on the platform's *value* — this function does a local
+        # `from gateway.config import Platform` further down, which makes the
+        # name function-local and unbound at this point.
+        if getattr(source.platform, "value", None) == "discord" and session_id:
             try:
                 from gateway import project_channels as _pc
 
