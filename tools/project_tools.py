@@ -113,7 +113,19 @@ def project_create(name: str, path: Optional[str] = None, task_id: Optional[str]
     primary = _primary_path(proj)
     _apply_workspace(task_id, primary, proj.name)
 
-    return json.dumps({"success": True, "id": proj.id, "slug": proj.slug, "name": proj.name, "primary_path": primary})
+    # Mirror as a Discord channel when the feature is on. Best-effort: a
+    # Discord failure must not fail project creation (see projects_cmd and
+    # tui_gateway for the sibling call sites).
+    discord_channel = None
+    try:
+        from gateway import project_channels as _pc
+
+        if _pc.is_enabled():
+            discord_channel = _pc.provision_project(proj.id)
+    except Exception:
+        discord_channel = None
+
+    return json.dumps({"success": True, "id": proj.id, "slug": proj.slug, "name": proj.name, "primary_path": primary, "discord_channel_id": discord_channel})
 
 
 def project_switch(project: str, task_id: Optional[str] = None) -> str:
