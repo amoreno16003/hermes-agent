@@ -200,7 +200,16 @@ def connect_closing(db_path: Optional[Path] = None):
 
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
-_OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color")
+_OPTIONAL_PROJECT_COLUMNS = (
+    "board_slug",
+    "primary_path",
+    "icon",
+    "color",
+    # Discord channel that mirrors this project (see gateway/project_channels.py).
+    # Stored as TEXT because Discord snowflakes exceed SQLite's signed-64-bit
+    # comfort range when round-tripped through some drivers.
+    "discord_channel_id",
+)
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -243,6 +252,7 @@ class Project:
     color: Optional[str] = None
     board_slug: Optional[str] = None
     primary_path: Optional[str] = None
+    discord_channel_id: Optional[str] = None
     archived: bool = False
     folders: List[ProjectFolder] = field(default_factory=list)
 
@@ -256,6 +266,7 @@ class Project:
             "color": self.color,
             "board_slug": self.board_slug,
             "primary_path": self.primary_path,
+            "discord_channel_id": self.discord_channel_id,
             "archived": bool(self.archived),
             "created_at": self.created_at,
             "folders": [f.to_dict() for f in self.folders],
@@ -274,6 +285,11 @@ def _project_from_row(row: sqlite3.Row) -> Project:
         color=row["color"] if "color" in keys else None,
         board_slug=row["board_slug"] if "board_slug" in keys else None,
         primary_path=row["primary_path"] if "primary_path" in keys else None,
+        discord_channel_id=(
+            str(row["discord_channel_id"])
+            if "discord_channel_id" in keys and row["discord_channel_id"] is not None
+            else None
+        ),
         archived=bool(row["archived"]) if "archived" in keys else False,
     )
 
@@ -422,12 +438,13 @@ def update_project(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     board_slug: Optional[str] = None,
+    discord_channel_id: Optional[str] = None,
 ) -> bool:
     """Patch top-level project fields. Only provided fields change.
 
-    ``icon``, ``color``, and ``board_slug`` accept an empty string to clear
-    (store NULL) — passing ``None`` leaves the field untouched, so callers that
-    want to clear must send ``""``.
+    ``icon``, ``color``, ``board_slug``, and ``discord_channel_id`` accept an
+    empty string to clear (store NULL) — passing ``None`` leaves the field
+    untouched, so callers that want to clear must send ``""``.
     """
     sets: List[str] = []
     params: List[object] = []
@@ -449,6 +466,10 @@ def update_project(
     if board_slug is not None:
         sets.append("board_slug = ?")
         params.append(normalize_slug(board_slug) if board_slug.strip() else None)
+    if discord_channel_id is not None:
+        sets.append("discord_channel_id = ?")
+        cid = str(discord_channel_id).strip()
+        params.append(cid or None)
     if not sets:
         return False
     params.append(project_id)
@@ -760,6 +781,32 @@ def project_for_path(
     if best_pid is None:
         return None
     return get_project(conn, best_pid)
+
+
+def project_for_channel(
+    conn: sqlite3.Connection, channel_id: str, *, include_archived: bool = False
+) -> Optional[Project]:
+    """Return the project bound to a Discord ``channel_id``, if any.
+
+    The inverse of :func:`project_for_path`: given the channel a gateway
+    message arrived in, resolve which project it mirrors. Comparison is on the
+    TEXT snowflake so an int-typed caller still matches.
+    """
+    cid = str(channel_id or "").strip()
+    if not cid:
+        return None
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
+    if "discord_channel_id" not in cols:
+        # Legacy DB opened without the migration (defensive; connect() applies
+        # it). Nothing can be bound yet, so there is no match to find.
+        return None
+    sql = "SELECT id FROM projects WHERE discord_channel_id = ?"
+    if not include_archived:
+        sql += " AND archived = 0"
+    row = conn.execute(sql, (cid,)).fetchone()
+    if row is None:
+        return None
+    return get_project(conn, row["id"])
 
 
 # Deterministic branch slug: lowercase, separators collapsed, capped.
