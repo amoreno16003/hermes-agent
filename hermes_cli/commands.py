@@ -177,7 +177,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[name]"),
 
     # Configuration
-    CommandDef("sessions", "Browse and resume previous sessions", "Session"),
+    CommandDef("sessions", "Browse and resume previous sessions", "Session",
+               args_hint="[all|full|search <q>|project [slug]]"),
+    CommandDef("project", "List Hermes projects or create one", "Session",
+               gateway_only=True, args_hint="[list|create <name>]",
+               aliases=("projects",)),
 
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",

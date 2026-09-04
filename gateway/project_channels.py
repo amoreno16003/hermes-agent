@@ -46,6 +46,12 @@ _CHANNEL_SAFE_RE = re.compile(r"[^a-z0-9-]+")
 DEFAULT_CHANNEL_PREFIX = "proj-"
 DEFAULT_CATEGORY_NAME = "Projects"
 
+# Where a project created FROM Discord gets its folder. Discord has no way to
+# pick a filesystem path, so new projects land in one configured root as
+# ``<root>/<Project Name>``. Overridable via
+# ``discord.project_channels.projects_root``.
+DEFAULT_PROJECTS_ROOT = os.path.join(os.path.expanduser("~"), "Hermes Projects")
+
 # Discord channel type constants (numeric in the REST API).
 _CHANNEL_TYPE_TEXT = 0
 _CHANNEL_TYPE_CATEGORY = 4
@@ -88,6 +94,10 @@ def settings(config: Optional[dict] = None) -> dict:
         # When true, a message in a project channel makes the agent operate in
         # that project's primary folder instead of the global TERMINAL_CWD.
         "bind_cwd": bool(raw.get("bind_cwd", True)),
+        # Root folder for projects created from Discord (see create_project_from_discord).
+        "projects_root": str(
+            raw.get("projects_root") or DEFAULT_PROJECTS_ROOT
+        ).strip(),
     }
 
 
@@ -366,6 +376,86 @@ def sync_all_projects(
 # ---------------------------------------------------------------------------
 
 
+def create_project_from_discord(
+    name: str, *, config: Optional[dict] = None
+) -> Dict[str, Any]:
+    """Create a project from Discord: make the folder, the row, and the channel.
+
+    Discord can't supply a filesystem path, so the folder is derived as
+    ``<projects_root>/<name>``. Returns a result dict the slash handler renders;
+    it never raises so a bad name or a Discord failure reports cleanly.
+
+    Ordering matters: the folder is created FIRST, because a project row whose
+    primary_path doesn't exist would silently fail cwd binding later.
+    """
+    result: Dict[str, Any] = {"ok": False, "error": "", "created_folder": False}
+    clean = str(name or "").strip()
+    if not clean:
+        result["error"] = "Project name must not be empty."
+        return result
+    # Reject path separators / traversal outright — the name becomes a folder.
+    if any(ch in clean for ch in ('/', '\\', ':', '*', '?', '"', '<', '>', '|')) or ".." in clean:
+        result["error"] = (
+            "Project name can't contain path separators or these characters: "
+            r"/ \ : * ? \" < > |"
+        )
+        return result
+
+    try:
+        s = settings(config)
+        root = os.path.abspath(os.path.expanduser(s["projects_root"]))
+        folder = os.path.join(root, clean)
+
+        # Containment check: the resolved folder must stay under the root even
+        # after normalisation, so a crafted name can't escape it.
+        if os.path.commonpath([root, os.path.abspath(folder)]) != root:
+            result["error"] = "Project name resolves outside the projects root."
+            return result
+
+        if not os.path.isdir(folder):
+            os.makedirs(folder, exist_ok=True)
+            result["created_folder"] = True
+
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            existing = pdb.project_for_path(conn, folder)
+            if existing is not None:
+                result.update(
+                    ok=True,
+                    already_existed=True,
+                    project_id=existing.id,
+                    slug=existing.slug,
+                    name=existing.name,
+                    folder=folder,
+                    channel_id=existing.discord_channel_id,
+                )
+                return result
+            pid = pdb.create_project(
+                conn, name=clean, folders=[folder], primary_path=folder
+            )
+            channel_id = provision_project(pid, config=config, conn=conn)
+            project = pdb.get_project(conn, pid)
+
+        result.update(
+            ok=True,
+            already_existed=False,
+            project_id=pid,
+            slug=project.slug if project else "",
+            name=clean,
+            folder=folder,
+            channel_id=channel_id,
+        )
+        return result
+    except Exception as exc:
+        logger.warning(
+            "project_channels: create_project_from_discord(%r) failed: %s",
+            name, exc, exc_info=True,
+        )
+        result["error"] = str(exc)
+        return result
+
+
 def cwd_for_channel(
     channel_id: str, parent_id: Optional[str] = None, config: Optional[dict] = None
 ) -> Optional[str]:
@@ -431,6 +521,7 @@ def channel_for_cwd(cwd: str, config: Optional[dict] = None) -> Optional[str]:
 __all__ = [
     "channel_for_cwd",
     "channel_name_for",
+    "create_project_from_discord",
     "cwd_for_channel",
     "ensure_category",
     "ensure_channel",

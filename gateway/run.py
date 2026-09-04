@@ -15249,6 +15249,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "sessions":
             return await self._handle_sessions_command(event)
 
+        if canonical == "project":
+            return await self._handle_project_command(event)
+
         if canonical == "branch":
             return await self._handle_branch_command(event)
 
