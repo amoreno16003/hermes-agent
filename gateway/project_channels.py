@@ -101,6 +101,10 @@ def settings(config: Optional[dict] = None) -> dict:
         # Copy new turns from mirrored (desktop/TUI/CLI) sessions into their
         # Discord thread so both surfaces show the same conversation.
         "relay_messages": bool(raw.get("relay_messages", True)),
+        # Seconds between mirror/relay passes. An idle pass is local-only
+        # (SQLite + JSON, no HTTP), so this can be low without hitting
+        # Discord's rate limits. Floored at 5s to keep a typo from spinning.
+        "poll_interval": max(5, int(raw.get("poll_interval") or 15)),
     }
 
 

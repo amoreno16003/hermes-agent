@@ -11589,17 +11589,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task.add_done_callback(_done)
         return task
 
-    async def _project_session_mirror_watcher(self, interval: float = 60.0) -> None:
+    async def _project_session_mirror_watcher(self, interval: Optional[float] = None) -> None:
         """Mirror project-linked sessions as threads in their project channel.
 
-        Every ``interval`` seconds, finds sessions whose cwd resolves to a
-        project with a bound Discord channel and which have no mirrored thread
-        yet, and creates one per session. This is what makes a project channel
-        show its sessions as threads without the user running any command.
+        Every ``interval`` seconds (default from
+        ``discord.project_channels.poll_interval``), finds sessions whose cwd
+        resolves to a project with a bound Discord channel and which have no
+        mirrored thread yet, creates one per session, then relays any new turns
+        into it. This is what makes a project channel show its sessions as
+        threads, and keep them current, without the user running any command.
 
         Discord-native sessions are skipped by ``sessions_needing_threads``:
         auto-thread already gave them their own thread, so mirroring would
         duplicate them.
+
+        An idle pass touches only local SQLite + JSON (no HTTP), so a short
+        interval costs ~0.07% of one core and never hits Discord's rate limit.
 
         Runs off the event loop (blocking HTTP + SQLite) and never propagates —
         a Discord outage or a revoked permission must not kill the watcher.
@@ -11607,9 +11612,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Let the gateway finish connecting before the first pass.
         await asyncio.sleep(20)
         while self._running:
+            sleep_for = float(interval) if interval else 15.0
             try:
                 from gateway import project_channels as _pc
 
+                _s = _pc.settings()
+                if interval is None:
+                    sleep_for = float(_s.get("poll_interval") or 15)
                 if _pc.is_enabled() and self._session_db is not None:
                     db = getattr(self._session_db, "_db", self._session_db)
                     results = await asyncio.to_thread(
@@ -11631,7 +11640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception as exc:
                 logger.warning("project_session_mirror: pass failed: %s", exc)
-            await asyncio.sleep(interval)
+            await asyncio.sleep(sleep_for)
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
