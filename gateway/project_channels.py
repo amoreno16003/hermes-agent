@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 DISCORD_API = "https://discord.com/api/v10"
 
+# Last ``retry_after`` Discord reported per endpoint path, so post_message can
+# wait the bucket's real cooldown instead of a guess before retrying a 429.
+_LAST_RETRY_AFTER: Dict[str, float] = {}
+
 # Discord rejects channel names with uppercase/spaces/most punctuation and caps
 # them at 100 chars. Slugs from projects_db are already lowercase-hyphenated,
 # but a hand-edited DB row could carry anything, so normalise defensively.
@@ -105,6 +109,13 @@ def settings(config: Optional[dict] = None) -> dict:
         # (SQLite + JSON, no HTTP), so this can be low without hitting
         # Discord's rate limits. Floored at 5s to keep a typo from spinning.
         "poll_interval": max(5, int(raw.get("poll_interval") or 15)),
+        # How many recent user/assistant turns to post into a thread the first
+        # time a session is mirrored, so the thread shows the actual
+        # conversation instead of only a header. 0 disables backfill (only
+        # NEW turns relay). Capped at 50: each message is one REST call, and
+        # a 466-message session would otherwise flood the channel and the
+        # rate limiter.
+        "backfill_limit": max(0, min(50, int(raw.get("backfill_limit", 20)))),
     }
 
 
@@ -170,6 +181,7 @@ def _request(
         retry_after = ""
         try:
             retry_after = str(resp.json().get("retry_after", ""))
+            _LAST_RETRY_AFTER[path] = float(retry_after)
         except Exception:
             pass
         logger.warning(
@@ -594,13 +606,26 @@ def create_thread_in_channel(
 
 
 def post_message(channel_id: str, content: str, token: Optional[str] = None) -> bool:
-    """Post a plain message to a channel/thread. Best-effort."""
+    """Post a plain message to a channel/thread, retrying a 429 once.
+
+    Discord's per-channel message bucket is ~5 posts / 5s. ``_request`` treats
+    a 429 as a soft failure and returns None, so a burst (a first-sight
+    backfill) would silently lose messages. Honour the ``retry_after`` the API
+    hands back and try once more before giving up.
+    """
+    import time as _time
+
     tok = token or _bot_token()
     if not tok:
         return False
-    res = _request(
-        "POST", f"/channels/{channel_id}/messages", tok, {"content": content[:1900]}
-    )
+    payload = {"content": content[:1900]}
+    path = f"/channels/{channel_id}/messages"
+    res = _request("POST", path, tok, payload)
+    if isinstance(res, dict):
+        return True
+    # Retry once after the bucket's own cooldown (plus a little headroom).
+    _time.sleep(_LAST_RETRY_AFTER.get(path, 1.0) + 0.25)
+    res = _request("POST", path, tok, payload)
     return isinstance(res, dict)
 
 
@@ -718,6 +743,12 @@ def relay_new_messages(
     Makes a session started on desktop/TUI/CLI show up in Discord as it
     happens, so both surfaces read the same conversation.
 
+    ``max_per_pass`` throttles the STEADY-STATE relay so a burst of new turns
+    is spread across passes rather than fired at Discord at once. A first-sight
+    backfill is deliberately exempt: its own ``backfill_limit`` already bounds
+    it, and truncating it here would advance the high-water mark past messages
+    that were never posted, losing them permanently.
+
     Echo-loop safety, in layers:
 
     1. Only sessions in the mirror state are relayed, and those are non-Discord
@@ -731,6 +762,8 @@ def relay_new_messages(
     Returns the number of messages relayed. Never raises.
     """
     relayed = 0
+    import time as _t
+
     try:
         s = settings(config)
         if not (s["enabled"] and s["guild_id"] and s["relay_messages"]):
@@ -755,9 +788,45 @@ def relay_new_messages(
 
             last_seen = state.get(session_id)
             if last_seen is None:
-                # First sight of this session: don't dump the whole backlog
-                # into the channel. Start from now.
-                state[session_id] = max(int(r.get("id") or 0) for r in rows)
+                # First sight of this session. Post the last N turns so the
+                # thread shows the actual conversation rather than just a
+                # header, then set the high-water mark past everything so
+                # nothing is duplicated on the next pass.
+                limit = int(s.get("backfill_limit") or 0)
+                highest = max(int(r.get("id") or 0) for r in rows)
+                if limit > 0:
+                    convo = [
+                        r for r in rows
+                        if str(r.get("role") or "") in {"user", "assistant"}
+                        and str(r.get("content") or "").strip()
+                        and RELAY_MARKER not in str(r.get("content") or "")
+                    ]
+                    tail = convo[-limit:]
+                    if len(convo) > len(tail):
+                        post_message(
+                            str(thread_id),
+                            f"{RELAY_MARKER} _…{len(convo) - len(tail)} earlier "
+                            f"message(s) not shown._",
+                            token=token,
+                        )
+                    for r in tail:
+                        role = str(r.get("role") or "")
+                        content = str(r.get("content") or "").strip()
+                        who = "🧑 **You**" if role == "user" else "🤖 **Hermes**"
+                        body = (
+                            content if len(content) <= 1500
+                            else content[:1500] + " …"
+                        )
+                        if post_message(
+                            str(thread_id),
+                            f"{RELAY_MARKER} {who}\n{body}",
+                            token=token,
+                        ):
+                            relayed += 1
+                        # Stay under Discord's ~5 msg / 5s per-channel bucket
+                        # instead of relying on the 429 retry to catch up.
+                        _t.sleep(1.1)
+                state[session_id] = highest
                 dirty = True
                 continue
 
