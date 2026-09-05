@@ -518,16 +518,194 @@ def channel_for_cwd(cwd: str, config: Optional[dict] = None) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Session -> thread mirroring
+# ---------------------------------------------------------------------------
+
+# Sessions whose thread we've already created, keyed by session id. Persisted
+# in state.db's session row (thread_id) for real bindings; this in-memory set
+# only suppresses duplicate work within one gateway process.
+_MIRRORED_SESSIONS: set = set()
+
+
+def mirror_state_path():
+    """Path of the JSON file recording session_id -> mirrored thread id."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "gateway" / "project_session_threads.json"
+
+
+def _read_mirror_state() -> Dict[str, str]:
+    import json
+
+    try:
+        path = mirror_state_path()
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_mirror_state(state: Dict[str, str]) -> None:
+    import json
+
+    try:
+        path = mirror_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=1)
+        tmp.replace(path)
+    except Exception as exc:
+        logger.debug("project_channels: could not persist mirror state: %s", exc)
+
+
+def create_thread_in_channel(
+    channel_id: str, name: str, token: Optional[str] = None
+) -> Optional[str]:
+    """Create a public thread under ``channel_id`` via REST. Returns its id.
+
+    Uses the threads endpoint directly (type 11 = PUBLIC_THREAD) so this works
+    from the mirror loop without a live discord.py client object.
+    """
+    tok = token or _bot_token()
+    if not tok:
+        return None
+    clean = (name or "session").strip()[:100] or "session"
+    created = _request(
+        "POST",
+        f"/channels/{channel_id}/threads",
+        tok,
+        {"name": clean, "type": 11, "auto_archive_duration": 10080},
+    )
+    if isinstance(created, dict) and created.get("id"):
+        return str(created["id"])
+    return None
+
+
+def post_message(channel_id: str, content: str, token: Optional[str] = None) -> bool:
+    """Post a plain message to a channel/thread. Best-effort."""
+    tok = token or _bot_token()
+    if not tok:
+        return False
+    res = _request(
+        "POST", f"/channels/{channel_id}/messages", tok, {"content": content[:1900]}
+    )
+    return isinstance(res, dict)
+
+
+def sessions_needing_threads(session_db: Any, *, limit: int = 500) -> List[dict]:
+    """Return session rows that belong to a project but have no mirrored thread.
+
+    A session qualifies when its cwd resolves to a project that has a bound
+    Discord channel, and we have not already created a thread for it. Sessions
+    that already LIVE in Discord (source='discord') are skipped: they already
+    have their own thread from auto-thread, so mirroring them would duplicate.
+    """
+    from hermes_cli import projects_db as pdb
+
+    out: List[dict] = []
+    try:
+        rows = session_db.list_sessions_rich(
+            source=None, exclude_sources=["tool"], limit=limit
+        )
+    except Exception as exc:
+        logger.debug("project_channels: could not list sessions: %s", exc)
+        return out
+
+    mirrored = _read_mirror_state()
+    with pdb.connect_closing() as conn:
+        for row in rows:
+            sid = str(row.get("id") or "")
+            if not sid or sid in mirrored or sid in _MIRRORED_SESSIONS:
+                continue
+            # Discord-native sessions already have a thread of their own.
+            if str(row.get("source") or "") == "discord":
+                continue
+            cwd = row.get("cwd") or row.get("git_repo_root") or ""
+            if not cwd:
+                continue
+            project = pdb.project_for_path(conn, str(cwd))
+            if project is None or not project.discord_channel_id:
+                continue
+            out.append(
+                {
+                    "session_id": sid,
+                    "title": row.get("title") or sid[:8],
+                    "source": row.get("source") or "",
+                    "channel_id": project.discord_channel_id,
+                    "project_name": project.name,
+                }
+            )
+    return out
+
+
+def mirror_sessions_to_threads(
+    session_db: Any, *, config: Optional[dict] = None, limit: int = 50
+) -> List[Tuple[str, Optional[str]]]:
+    """Create a Discord thread for each project-linked session missing one.
+
+    Returns ``[(session_id, thread_id_or_None), ...]``. Idempotent: a session
+    is recorded in the mirror state once its thread exists, so repeat runs are
+    no-ops. Never raises.
+    """
+    results: List[Tuple[str, Optional[str]]] = []
+    try:
+        if not is_enabled(config):
+            return results
+        token = _bot_token()
+        if not token:
+            return results
+
+        pending = sessions_needing_threads(session_db)
+        if not pending:
+            return results
+
+        state = _read_mirror_state()
+        for item in pending[:limit]:
+            sid = item["session_id"]
+            thread_name = f"{item['title']}"[:100]
+            tid = create_thread_in_channel(
+                item["channel_id"], thread_name, token=token
+            )
+            if tid:
+                state[sid] = tid
+                _MIRRORED_SESSIONS.add(sid)
+                post_message(
+                    tid,
+                    f"🔗 **{item['title']}**\n"
+                    f"Session `{sid}` · started on `{item['source']}`\n"
+                    f"Continue it here with `/resume {sid}`.",
+                    token=token,
+                )
+                logger.info(
+                    "project_channels: mirrored session %s -> thread %s (%s)",
+                    sid, tid, item["project_name"],
+                )
+            results.append((sid, tid))
+        _write_mirror_state(state)
+    except Exception as exc:
+        logger.warning("project_channels: session mirroring failed: %s", exc)
+    return results
+
+
 __all__ = [
     "channel_for_cwd",
     "channel_name_for",
     "create_project_from_discord",
+    "create_thread_in_channel",
     "cwd_for_channel",
     "ensure_category",
     "ensure_channel",
     "is_enabled",
     "list_guild_channels",
+    "mirror_sessions_to_threads",
+    "post_message",
     "provision_project",
+    "sessions_needing_threads",
     "settings",
     "sync_all_projects",
 ]

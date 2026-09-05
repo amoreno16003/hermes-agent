@@ -11434,6 +11434,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # loop the way a long-lived watcher would be.
                     restart=False,
                 )
+
+                # Long-lived: mirror each project-linked session as a thread in
+                # its project's channel, so the channel shows one thread per
+                # session without the user doing anything.
+                self._spawn_supervised(
+                    self._project_session_mirror_watcher,
+                    "project_session_mirror",
+                )
         except Exception:  # noqa: BLE001 - provisioning must never block startup
             logger.debug("project_channels: startup backfill skipped", exc_info=True)
 
@@ -11580,6 +11588,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         task.add_done_callback(_done)
         return task
+
+    async def _project_session_mirror_watcher(self, interval: float = 60.0) -> None:
+        """Mirror project-linked sessions as threads in their project channel.
+
+        Every ``interval`` seconds, finds sessions whose cwd resolves to a
+        project with a bound Discord channel and which have no mirrored thread
+        yet, and creates one per session. This is what makes a project channel
+        show its sessions as threads without the user running any command.
+
+        Discord-native sessions are skipped by ``sessions_needing_threads``:
+        auto-thread already gave them their own thread, so mirroring would
+        duplicate them.
+
+        Runs off the event loop (blocking HTTP + SQLite) and never propagates —
+        a Discord outage or a revoked permission must not kill the watcher.
+        """
+        # Let the gateway finish connecting before the first pass.
+        await asyncio.sleep(20)
+        while self._running:
+            try:
+                from gateway import project_channels as _pc
+
+                if _pc.is_enabled() and self._session_db is not None:
+                    db = getattr(self._session_db, "_db", self._session_db)
+                    results = await asyncio.to_thread(
+                        _pc.mirror_sessions_to_threads, db
+                    )
+                    made = [t for _s, t in results if t]
+                    if made:
+                        logger.info(
+                            "project_channels: mirrored %d session(s) as threads",
+                            len(made),
+                        )
+            except Exception as exc:
+                logger.warning("project_session_mirror: pass failed: %s", exc)
+            await asyncio.sleep(interval)
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
