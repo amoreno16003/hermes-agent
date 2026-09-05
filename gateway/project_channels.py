@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -613,8 +614,6 @@ def post_message(channel_id: str, content: str, token: Optional[str] = None) -> 
     backfill) would silently lose messages. Honour the ``retry_after`` the API
     hands back and try once more before giving up.
     """
-    import time as _time
-
     tok = token or _bot_token()
     if not tok:
         return False
@@ -624,7 +623,7 @@ def post_message(channel_id: str, content: str, token: Optional[str] = None) -> 
     if isinstance(res, dict):
         return True
     # Retry once after the bucket's own cooldown (plus a little headroom).
-    _time.sleep(_LAST_RETRY_AFTER.get(path, 1.0) + 0.25)
+    time.sleep(_LAST_RETRY_AFTER.get(path, 1.0) + 0.25)
     res = _request("POST", path, tok, payload)
     return isinstance(res, dict)
 
@@ -734,6 +733,36 @@ def _write_relay_state(state: Dict[str, int]) -> None:
 # we posted, never original content — the echo-loop guard depends on it.
 RELAY_MARKER = "\u2937"  # ⤷
 
+# Discord's hard cap is 2000; leave room for the marker and role prefix.
+_RELAY_BODY_LIMIT = 1500
+
+# Discord's per-channel message bucket is ~5 / 5s. Pace a backfill under it
+# rather than leaning on post_message's 429 retry to claw each one back.
+_RELAY_POST_SPACING = 1.1
+
+_RELAY_ROLES = frozenset({"user", "assistant"})
+
+
+def _relayable(row: dict) -> bool:
+    """Whether a message row should be copied to Discord.
+
+    Excludes tool/system turns, blanks, and anything already carrying
+    ``RELAY_MARKER`` (i.e. a copy we posted — re-relaying it would loop).
+    """
+    if str(row.get("role") or "") not in _RELAY_ROLES:
+        return False
+    content = str(row.get("content") or "").strip()
+    return bool(content) and RELAY_MARKER not in content
+
+
+def _relay_text(row: dict) -> str:
+    """Render one message row as the Discord message body."""
+    content = str(row.get("content") or "").strip()
+    if len(content) > _RELAY_BODY_LIMIT:
+        content = content[:_RELAY_BODY_LIMIT] + " …"
+    who = "🧑 **You**" if row.get("role") == "user" else "🤖 **Hermes**"
+    return f"{RELAY_MARKER} {who}\n{content}"
+
 
 def relay_new_messages(
     session_db: Any, *, config: Optional[dict] = None, max_per_pass: int = 8
@@ -762,8 +791,6 @@ def relay_new_messages(
     Returns the number of messages relayed. Never raises.
     """
     relayed = 0
-    import time as _t
-
     try:
         s = settings(config)
         if not (s["enabled"] and s["guild_id"] and s["relay_messages"]):
@@ -787,20 +814,17 @@ def relay_new_messages(
                 continue
 
             last_seen = state.get(session_id)
+            highest = max(int(r.get("id") or 0) for r in rows)
+
             if last_seen is None:
-                # First sight of this session. Post the last N turns so the
-                # thread shows the actual conversation rather than just a
-                # header, then set the high-water mark past everything so
-                # nothing is duplicated on the next pass.
+                # First sight: post the last N turns so the thread shows the
+                # conversation rather than just a header, then mark past
+                # everything so the steady-state loop won't duplicate them.
+                # Deliberately exempt from max_per_pass — truncating here would
+                # advance the mark past messages never posted.
                 limit = int(s.get("backfill_limit") or 0)
-                highest = max(int(r.get("id") or 0) for r in rows)
                 if limit > 0:
-                    convo = [
-                        r for r in rows
-                        if str(r.get("role") or "") in {"user", "assistant"}
-                        and str(r.get("content") or "").strip()
-                        and RELAY_MARKER not in str(r.get("content") or "")
-                    ]
+                    convo = [r for r in rows if _relayable(r)]
                     tail = convo[-limit:]
                     if len(convo) > len(tail):
                         post_message(
@@ -810,22 +834,9 @@ def relay_new_messages(
                             token=token,
                         )
                     for r in tail:
-                        role = str(r.get("role") or "")
-                        content = str(r.get("content") or "").strip()
-                        who = "🧑 **You**" if role == "user" else "🤖 **Hermes**"
-                        body = (
-                            content if len(content) <= 1500
-                            else content[:1500] + " …"
-                        )
-                        if post_message(
-                            str(thread_id),
-                            f"{RELAY_MARKER} {who}\n{body}",
-                            token=token,
-                        ):
+                        if post_message(str(thread_id), _relay_text(r), token=token):
                             relayed += 1
-                        # Stay under Discord's ~5 msg / 5s per-channel bucket
-                        # instead of relying on the 429 retry to catch up.
-                        _t.sleep(1.1)
+                        time.sleep(_RELAY_POST_SPACING)
                 state[session_id] = highest
                 dirty = True
                 continue
@@ -834,24 +845,14 @@ def relay_new_messages(
                 rid = int(row.get("id") or 0)
                 if rid <= last_seen:
                     continue
-                role = str(row.get("role") or "")
-                if role not in {"user", "assistant"}:
-                    state[session_id] = max(state.get(session_id, 0), rid)
-                    dirty = True
-                    continue
-                content = str(row.get("content") or "").strip()
-                if not content or RELAY_MARKER in content:
-                    state[session_id] = max(state.get(session_id, 0), rid)
-                    dirty = True
-                    continue
-                who = "🧑 **You**" if role == "user" else "🤖 **Hermes**"
-                body = content if len(content) <= 1500 else content[:1500] + " …"
-                if post_message(
-                    str(thread_id), f"{RELAY_MARKER} {who}\n{body}", token=token
-                ):
-                    relayed += 1
+                # Advance the mark for every row we consider, relayable or not:
+                # a skipped tool turn must never be re-examined next pass.
                 state[session_id] = max(state.get(session_id, 0), rid)
                 dirty = True
+                if not _relayable(row):
+                    continue
+                if post_message(str(thread_id), _relay_text(row), token=token):
+                    relayed += 1
                 if relayed >= max_per_pass:
                     break
             if relayed >= max_per_pass:
