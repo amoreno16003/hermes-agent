@@ -258,7 +258,14 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: the tokenizer handed us a path containing an embedded NUL
+        # (it happens when a referenced *binary* — python.exe, a compiled
+        # helper — gets scanned and its machine code is decoded into junk
+        # "paths"). os.open raises ValueError, not OSError, for those, so
+        # without this the guard crashes the whole terminal call instead of
+        # skipping an unscannable path. Same failure class as #76762, one
+        # frame earlier.
         return None, False
     try:
         metadata = os.fstat(descriptor)

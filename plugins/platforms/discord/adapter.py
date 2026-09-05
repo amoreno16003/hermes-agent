@@ -5488,6 +5488,20 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_resume(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/resume {name}".strip())
 
+        @tree.command(name="sessions", description="Browse sessions (all / full / search / project)")
+        @discord.app_commands.describe(
+            args="Empty for this chat, 'all' for every surface, 'project' to group by project, 'search <q>'."
+        )
+        async def slash_sessions(interaction: discord.Interaction, args: str = ""):
+            await self._run_simple_slash(interaction, f"/sessions {args}".strip())
+
+        @tree.command(name="project", description="List Hermes projects or create one")
+        @discord.app_commands.describe(
+            args="'list' (default) or 'create <name>' — the folder is made under your projects root."
+        )
+        async def slash_project(interaction: discord.Interaction, args: str = ""):
+            await self._run_simple_slash(interaction, f"/project {args}".strip())
+
         @tree.command(name="usage", description="Show token usage for this session")
         async def slash_usage(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/usage")

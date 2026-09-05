@@ -101,6 +101,16 @@ def build_parser(
         "board", nargs="?", default="", help="Board slug (omit to unbind)"
     )
 
+    p_sync = sub.add_parser(
+        "sync-discord",
+        help="Create missing Discord channels for projects (idempotent)",
+    )
+    p_sync.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="Also provision channels for archived projects",
+    )
+
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -133,6 +143,7 @@ def projects_command(args: argparse.Namespace) -> int:
         "archive": _cmd_archive,
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
+        "sync-discord": _cmd_sync_discord,
     }
     handler = handlers.get(action)
     if handler is None:
@@ -212,7 +223,30 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print("project: vanished after create", file=sys.stderr)
         return 2
     print(f"Created project {proj.slug} ({pid})")
-    _print_project(proj)
+
+    # Mirror the new project as a Discord channel when the feature is on.
+    # Best-effort by contract: a Discord outage or a missing permission must
+    # never fail `hermes project create`.
+    try:
+        from gateway import project_channels as _pc
+
+        if _pc.is_enabled():
+            cid = _pc.provision_project(pid)
+            if cid:
+                print(f"Discord: bound to #{_pc.channel_name_for(proj.slug)} ({cid})")
+            else:
+                print(
+                    "Discord: channel provisioning skipped (see logs); "
+                    "retry with `hermes project sync-discord`."
+                )
+            proj = None
+            with pdb.connect_closing() as conn:
+                proj = pdb.get_project(conn, pid)
+    except Exception as exc:
+        print(f"Discord: channel provisioning failed: {exc}", file=sys.stderr)
+
+    if proj is not None:
+        _print_project(proj)
     return 0
 
 
@@ -311,6 +345,48 @@ def _cmd_bind_board(args, conn, proj) -> int:
         _sync_board_default_workdir(proj, args.board)
     else:
         print(f"Unbound board from {proj.slug}")
+    return 0
+
+
+def _cmd_sync_discord(args: argparse.Namespace) -> int:
+    """Create any missing Discord channels for existing projects."""
+    try:
+        from gateway import project_channels as _pc
+    except Exception as exc:
+        print(f"project: cannot load Discord support: {exc}", file=sys.stderr)
+        return 2
+
+    s = _pc.settings()
+    if not s["enabled"]:
+        print(
+            "Discord project channels are disabled.\n"
+            "Enable with: hermes config set discord.project_channels.enabled true"
+        )
+        return 1
+    if not s["guild_id"]:
+        print(
+            "discord.project_channels.guild_id is not set.\n"
+            "Set it with: hermes config set discord.project_channels.guild_id <id>",
+            file=sys.stderr,
+        )
+        return 2
+
+    results = _pc.sync_all_projects(
+        include_archived=getattr(args, "include_archived", False)
+    )
+    if not results:
+        print("No projects to sync.")
+        return 0
+    failed = 0
+    for slug, cid in results:
+        if cid:
+            print(f"  {slug:24} -> #{_pc.channel_name_for(slug)} ({cid})")
+        else:
+            failed += 1
+            print(f"  {slug:24} -> FAILED (see logs)", file=sys.stderr)
+    if failed:
+        print(f"\n{failed} project(s) could not be provisioned.", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -177,7 +177,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[name]"),
 
     # Configuration
-    CommandDef("sessions", "Browse and resume previous sessions", "Session"),
+    CommandDef("sessions", "Browse and resume previous sessions", "Session",
+               args_hint="[all|full|search <q>|project [slug]]"),
+    CommandDef("project", "List Hermes projects or create one", "Session",
+               gateway_only=True, args_hint="[list|create <name>]"),
 
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
@@ -1257,7 +1260,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "project"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -104,6 +104,16 @@ def build_relay_command_manifest() -> List[Dict[str, Any]]:
             "description": "Resume a previously-named session",
             "options": [_opt("name", "Session title or id")],
         },
+        {
+            "name": "sessions",
+            "description": "Browse sessions (all / full / search / project)",
+            "options": [_opt("args", "all | full | search <q> | project [slug]")],
+        },
+        {
+            "name": "project",
+            "description": "List Hermes projects or create one",
+            "options": [_opt("args", "list | create <name>")],
+        },
         {"name": "usage", "description": "Show token usage for this session"},
         {"name": "help", "description": "Show available commands"},
         {"name": "insights", "description": "Show usage insights and analytics"},

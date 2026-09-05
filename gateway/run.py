@@ -11405,6 +11405,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
 
+        # Backfill Discord channels for any project that doesn't have one yet.
+        # Covers projects created outside `hermes project create` (desktop UI,
+        # direct DB writes, a restored backup). Runs off the event loop because
+        # provisioning is blocking HTTP, and never blocks startup on failure.
+        try:
+            from gateway import project_channels as _pc
+
+            if _pc.is_enabled():
+                async def _project_channel_backfill() -> None:
+                    try:
+                        results = await asyncio.to_thread(_pc.sync_all_projects)
+                        created = [s for s, cid in results if cid]
+                        if created:
+                            logger.info(
+                                "project_channels: %d project channel(s) ready",
+                                len(created),
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "project_channels: startup backfill failed: %s", exc
+                        )
+
+                self._spawn_supervised(
+                    _project_channel_backfill,
+                    "project_channel_backfill",
+                    # One-shot: a completed backfill must not be respawned in a
+                    # loop the way a long-lived watcher would be.
+                    restart=False,
+                )
+
+                # Long-lived: mirror each project-linked session as a thread in
+                # its project's channel, so the channel shows one thread per
+                # session without the user doing anything.
+                self._spawn_supervised(
+                    self._project_session_mirror_watcher,
+                    "project_session_mirror",
+                )
+        except Exception:  # noqa: BLE001 - provisioning must never block startup
+            logger.debug("project_channels: startup backfill skipped", exc_info=True)
+
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
@@ -11549,6 +11589,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task.add_done_callback(_done)
         return task
 
+    async def _project_session_mirror_watcher(self, interval: Optional[float] = None) -> None:
+        """Mirror project-linked sessions as threads in their project channel.
+
+        Every ``interval`` seconds (default from
+        ``discord.project_channels.poll_interval``), finds sessions whose cwd
+        resolves to a project with a bound Discord channel and which have no
+        mirrored thread yet, creates one per session, then relays any new turns
+        into it. This is what makes a project channel show its sessions as
+        threads, and keep them current, without the user running any command.
+
+        Discord-native sessions are skipped by ``sessions_needing_threads``:
+        auto-thread already gave them their own thread, so mirroring would
+        duplicate them.
+
+        An idle pass touches only local SQLite + JSON (no HTTP), so a short
+        interval costs ~0.07% of one core and never hits Discord's rate limit.
+
+        Runs off the event loop (blocking HTTP + SQLite) and never propagates —
+        a Discord outage or a revoked permission must not kill the watcher.
+        """
+        # Let the gateway finish connecting before the first pass.
+        await asyncio.sleep(20)
+        while self._running:
+            sleep_for = float(interval) if interval else 15.0
+            try:
+                from gateway import project_channels as _pc
+
+                _s = _pc.settings()
+                if interval is None:
+                    sleep_for = float(_s.get("poll_interval") or 15)
+                if _pc.is_enabled() and self._session_db is not None:
+                    db = getattr(self._session_db, "_db", self._session_db)
+                    results = await asyncio.to_thread(
+                        _pc.mirror_sessions_to_threads, db
+                    )
+                    made = [t for _s, t in results if t]
+                    if made:
+                        logger.info(
+                            "project_channels: mirrored %d session(s) as threads",
+                            len(made),
+                        )
+                    # Copy any new turns from those sessions into their thread
+                    # so a desktop/TUI conversation shows up in Discord live.
+                    relayed = await asyncio.to_thread(_pc.relay_new_messages, db)
+                    if relayed:
+                        logger.info(
+                            "project_channels: relayed %d message(s) to Discord",
+                            relayed,
+                        )
+            except Exception as exc:
+                logger.warning("project_session_mirror: pass failed: %s", exc)
+            await asyncio.sleep(sleep_for)
+
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
 
@@ -11639,6 +11732,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         cli_title = row.get("title") or cli_session_id[:8]
 
+        # Project channels: deliver the handoff into the channel mirroring the
+        # project that owns this session's cwd, instead of the single global
+        # home channel. Falls back to home when the feature is off, the session
+        # has no cwd, or its cwd belongs to no project — so an unmapped session
+        # behaves exactly as before.
+        target_chat_id = str(home.chat_id)
+        if platform == Platform.DISCORD:
+            try:
+                from gateway import project_channels as _pc
+
+                _session_cwd = row.get("cwd") or row.get("git_repo_root") or ""
+                _proj_channel = _pc.channel_for_cwd(_session_cwd)
+                if _proj_channel:
+                    logger.info(
+                        "Handoff: routing '%s' to project channel %s (cwd=%s)",
+                        cli_title, _proj_channel, _session_cwd,
+                    )
+                    target_chat_id = _proj_channel
+            except Exception as exc:
+                logger.debug("Handoff: project-channel routing skipped: %s", exc)
+
         # Try to create a fresh thread on the destination so the handoff
         # has its own scrollback. Adapter returns None if threading isn't
         # supported (Matrix/WhatsApp/Signal/SMS) or if creation failed
@@ -11648,7 +11762,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         thread_name = f"Hermes — {cli_title}"
         try:
             new_thread_id = await adapter.create_handoff_thread(
-                str(home.chat_id), thread_name,
+                target_chat_id, thread_name,
             )
         except Exception as exc:
             logger.debug(
@@ -11672,7 +11786,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # source shape as the user's next real message; otherwise the synthetic
         # handoff turn binds a generic `thread` session key while real replies
         # arrive on a `dm` session key.
-        home_chat_id = str(home.chat_id)
+        # ``target_chat_id`` is the project channel when one is bound, else the
+        # configured home channel — the thread above was created under it, so
+        # every downstream identity must agree with it rather than re-deriving
+        # from ``home``. Otherwise a failed thread creation would silently drop
+        # the handoff back into the home channel.
+        home_chat_id = target_chat_id
         is_telegram_private_chat = (
             platform == Platform.TELEGRAM
             and looks_like_telegram_private_chat_id(home_chat_id)
@@ -11768,7 +11887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.info(
             "Handoff: dispatching synthetic turn for CLI session %s → %s "
             "(home=%s, thread=%s, session_key=%s)",
-            cli_session_id, platform_name, home.chat_id, effective_thread_id,
+            cli_session_id, platform_name, target_chat_id, effective_thread_id,
             session_key,
         )
 
@@ -11793,7 +11912,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             result = await transport.send(
                 platform,
-                str(home.chat_id),
+                target_chat_id,
                 response_text,
                 send_metadata or None,
             )
@@ -15191,6 +15310,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "sessions":
             return await self._handle_sessions_command(event)
 
+        if canonical == "project":
+            return await self._handle_project_command(event)
+
         if canonical == "branch":
             return await self._handle_branch_command(event)
 
@@ -16189,6 +16311,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
+
+        # Mirrored project threads: a thread created by the session mirror
+        # stands for a session that ran on another surface (desktop/TUI/CLI).
+        # Bind this lane to that session the first time the user types in it,
+        # so the thread simply CONTINUES that conversation instead of starting
+        # a fresh one. Mirrors the Telegram topic-binding override below.
+        # Only rebinds when the lane isn't already on the target session, so
+        # subsequent turns are a no-op and the transcript isn't re-ended.
+        if getattr(source.platform, "value", None) == "discord" and source.thread_id:
+            try:
+                from gateway import project_channels as _pc
+
+                _mirror_sid = await asyncio.to_thread(
+                    _pc.mirrored_session_for_thread, str(source.thread_id)
+                )
+                if _mirror_sid and session_entry.session_id != _mirror_sid:
+                    _switched = await self.async_session_store.switch_session(
+                        session_key, _mirror_sid
+                    )
+                    if _switched is not None:
+                        session_entry = _switched
+                        logger.info(
+                            "project_channels: bound mirrored thread %s to session %s",
+                            source.thread_id, _mirror_sid,
+                        )
+            except Exception as _mb_err:
+                logger.debug(
+                    "project_channels: mirrored-thread binding skipped: %s", _mb_err
+                )
+
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
@@ -24058,6 +24210,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+
+        # Project channels: when this Discord channel (or the parent of this
+        # thread) mirrors a Hermes project, run the turn in that project's
+        # primary folder instead of the gateway-global TERMINAL_CWD. Registered
+        # per-session rather than mutating os.environ, so concurrent sessions in
+        # different project channels don't clobber each other's cwd.
+        #
+        # NB: compare on the platform's *value* — this function does a local
+        # `from gateway.config import Platform` further down, which makes the
+        # name function-local and unbound at this point.
+        if getattr(source.platform, "value", None) == "discord" and session_id:
+            try:
+                from gateway import project_channels as _pc
+
+                _proj_cwd = _pc.cwd_for_channel(
+                    source.chat_id,
+                    parent_id=getattr(source, "parent_chat_id", None)
+                    or source.chat_id,
+                    config=user_config,
+                )
+                if _proj_cwd:
+                    from tools.terminal_tool import register_task_env_overrides
+
+                    register_task_env_overrides(session_id, {"cwd": _proj_cwd})
+                    # Also PERSIST it on the session row. _launch_cwd_for_session
+                    # only stamps cwd for source='cli', so a gateway session
+                    # would otherwise have cwd=NULL forever — and project
+                    # membership is resolved from cwd (project_for_path), so
+                    # without this a thread started in #proj-foo never links to
+                    # that project in /sessions project or the thread mirror.
+                    # update_session_cwd only writes non-empty values, so this
+                    # can't clobber a real cwd recorded by another surface.
+                    if self._session_db is not None:
+                        try:
+                            await asyncio.to_thread(
+                                getattr(
+                                    self._session_db, "_db", self._session_db
+                                ).update_session_cwd,
+                                session_id,
+                                _proj_cwd,
+                            )
+                        except Exception as _cwd_err:
+                            logger.debug(
+                                "project_channels: could not persist cwd: %s",
+                                _cwd_err,
+                            )
+            except Exception as _pc_err:
+                logger.debug("project_channels: cwd binding skipped: %s", _pc_err)
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
