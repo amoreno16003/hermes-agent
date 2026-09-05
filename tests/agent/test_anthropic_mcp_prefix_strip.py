@@ -18,6 +18,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -215,6 +217,16 @@ class TestAnthropicOAuthClassifierAlias:
     """OAuth must alias the two schemas issue #65365 isolated as independent,
     deterministic triggers (session_search alone, memory alone) — in tool
     name, tool description, system-prompt prose, and named tool_choice."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_local_system_relocation(self, monkeypatch):
+        """LOCAL FORK ONLY: the subscription-billing patch (commit
+        'DO NOT REVERT') moves app system blocks into the first user turn
+        under HERMES_OAUTH_RELOCATE_SYSTEM (default on), so the system-prose
+        assertions below would look at an empty system prompt. Pin the toggle
+        off here — these tests exercise the alias/sanitize mechanics, which
+        still govern the non-relocated path."""
+        monkeypatch.setenv("HERMES_OAUTH_RELOCATE_SYSTEM", "0")
 
     def _build(self, tools, is_oauth=True, messages=None, tool_choice=None):
         from agent.anthropic_adapter import build_anthropic_kwargs
