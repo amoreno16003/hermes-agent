@@ -98,6 +98,9 @@ def settings(config: Optional[dict] = None) -> dict:
         "projects_root": str(
             raw.get("projects_root") or DEFAULT_PROJECTS_ROOT
         ).strip(),
+        # Copy new turns from mirrored (desktop/TUI/CLI) sessions into their
+        # Discord thread so both surfaces show the same conversation.
+        "relay_messages": bool(raw.get("relay_messages", True)),
     }
 
 
@@ -643,6 +646,151 @@ def sessions_needing_threads(session_db: Any, *, limit: int = 500) -> List[dict]
     return out
 
 
+def mirrored_session_for_thread(thread_id: str) -> Optional[str]:
+    """Return the session id a mirrored thread points at, if any.
+
+    Inverse of the mirror state written by :func:`mirror_sessions_to_threads`.
+    Lets the gateway bind an inbound message in a mirrored thread to the
+    session that thread represents, so the user can just type instead of
+    running ``/resume <id>`` first.
+    """
+    tid = str(thread_id or "").strip()
+    if not tid:
+        return None
+    try:
+        for session_id, mapped in _read_mirror_state().items():
+            if str(mapped) == tid:
+                return session_id
+    except Exception as exc:
+        logger.debug("project_channels: mirrored_session_for_thread failed: %s", exc)
+    return None
+
+
+def relay_state_path():
+    """Path of the JSON file recording the last relayed message id per session."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "gateway" / "project_session_relay.json"
+
+
+def _read_relay_state() -> Dict[str, int]:
+    import json
+
+    try:
+        path = relay_state_path()
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {str(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_relay_state(state: Dict[str, int]) -> None:
+    import json
+
+    try:
+        path = relay_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=1)
+        tmp.replace(path)
+    except Exception as exc:
+        logger.debug("project_channels: could not persist relay state: %s", exc)
+
+
+# Marker prepended to every relayed message. Any message carrying it is a copy
+# we posted, never original content — the echo-loop guard depends on it.
+RELAY_MARKER = "\u2937"  # ⤷
+
+
+def relay_new_messages(
+    session_db: Any, *, config: Optional[dict] = None, max_per_pass: int = 8
+) -> int:
+    """Copy new turns from mirrored sessions into their Discord thread.
+
+    Makes a session started on desktop/TUI/CLI show up in Discord as it
+    happens, so both surfaces read the same conversation.
+
+    Echo-loop safety, in layers:
+
+    1. Only sessions in the mirror state are relayed, and those are non-Discord
+       by construction (``sessions_needing_threads`` skips ``source='discord'``).
+       A Discord-native session is therefore never a relay source.
+    2. A per-session high-water mark (last relayed message row id) means a
+       message is copied at most once, ever.
+    3. Relayed text carries ``RELAY_MARKER``; anything already marked is
+       skipped, so a copy can never be re-copied.
+
+    Returns the number of messages relayed. Never raises.
+    """
+    relayed = 0
+    try:
+        s = settings(config)
+        if not (s["enabled"] and s["guild_id"] and s["relay_messages"]):
+            return 0
+        token = _bot_token()
+        if not token:
+            return 0
+
+        mirror = _read_mirror_state()
+        if not mirror:
+            return 0
+        state = _read_relay_state()
+        dirty = False
+
+        for session_id, thread_id in mirror.items():
+            try:
+                rows = session_db.get_messages(session_id) or []
+            except Exception:
+                continue
+            if not rows:
+                continue
+
+            last_seen = state.get(session_id)
+            if last_seen is None:
+                # First sight of this session: don't dump the whole backlog
+                # into the channel. Start from now.
+                state[session_id] = max(int(r.get("id") or 0) for r in rows)
+                dirty = True
+                continue
+
+            for row in rows:
+                rid = int(row.get("id") or 0)
+                if rid <= last_seen:
+                    continue
+                role = str(row.get("role") or "")
+                if role not in {"user", "assistant"}:
+                    state[session_id] = max(state.get(session_id, 0), rid)
+                    dirty = True
+                    continue
+                content = str(row.get("content") or "").strip()
+                if not content or RELAY_MARKER in content:
+                    state[session_id] = max(state.get(session_id, 0), rid)
+                    dirty = True
+                    continue
+                who = "🧑 **You**" if role == "user" else "🤖 **Hermes**"
+                body = content if len(content) <= 1500 else content[:1500] + " …"
+                if post_message(
+                    str(thread_id), f"{RELAY_MARKER} {who}\n{body}", token=token
+                ):
+                    relayed += 1
+                state[session_id] = max(state.get(session_id, 0), rid)
+                dirty = True
+                if relayed >= max_per_pass:
+                    break
+            if relayed >= max_per_pass:
+                break
+
+        if dirty:
+            _write_relay_state(state)
+    except Exception as exc:
+        logger.warning("project_channels: relay pass failed: %s", exc)
+    return relayed
+
+
 def mirror_sessions_to_threads(
     session_db: Any, *, config: Optional[dict] = None, limit: int = 50
 ) -> List[Tuple[str, Optional[str]]]:
@@ -678,7 +826,7 @@ def mirror_sessions_to_threads(
                     tid,
                     f"🔗 **{item['title']}**\n"
                     f"Session `{sid}` · started on `{item['source']}`\n"
-                    f"Continue it here with `/resume {sid}`.",
+                    f"Just type here to continue this conversation.",
                     token=token,
                 )
                 logger.info(
@@ -703,8 +851,10 @@ __all__ = [
     "is_enabled",
     "list_guild_channels",
     "mirror_sessions_to_threads",
+    "mirrored_session_for_thread",
     "post_message",
     "provision_project",
+    "relay_new_messages",
     "sessions_needing_threads",
     "settings",
     "sync_all_projects",

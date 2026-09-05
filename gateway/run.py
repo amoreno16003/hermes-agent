@@ -11621,6 +11621,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "project_channels: mirrored %d session(s) as threads",
                             len(made),
                         )
+                    # Copy any new turns from those sessions into their thread
+                    # so a desktop/TUI conversation shows up in Discord live.
+                    relayed = await asyncio.to_thread(_pc.relay_new_messages, db)
+                    if relayed:
+                        logger.info(
+                            "project_channels: relayed %d message(s) to Discord",
+                            relayed,
+                        )
             except Exception as exc:
                 logger.warning("project_session_mirror: pass failed: %s", exc)
             await asyncio.sleep(interval)
@@ -16294,6 +16302,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
+
+        # Mirrored project threads: a thread created by the session mirror
+        # stands for a session that ran on another surface (desktop/TUI/CLI).
+        # Bind this lane to that session the first time the user types in it,
+        # so the thread simply CONTINUES that conversation instead of starting
+        # a fresh one. Mirrors the Telegram topic-binding override below.
+        # Only rebinds when the lane isn't already on the target session, so
+        # subsequent turns are a no-op and the transcript isn't re-ended.
+        if getattr(source.platform, "value", None) == "discord" and source.thread_id:
+            try:
+                from gateway import project_channels as _pc
+
+                _mirror_sid = await asyncio.to_thread(
+                    _pc.mirrored_session_for_thread, str(source.thread_id)
+                )
+                if _mirror_sid and session_entry.session_id != _mirror_sid:
+                    _switched = await self.async_session_store.switch_session(
+                        session_key, _mirror_sid
+                    )
+                    if _switched is not None:
+                        session_entry = _switched
+                        logger.info(
+                            "project_channels: bound mirrored thread %s to session %s",
+                            source.thread_id, _mirror_sid,
+                        )
+            except Exception as _mb_err:
+                logger.debug(
+                    "project_channels: mirrored-thread binding skipped: %s", _mb_err
+                )
+
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
