@@ -24234,6 +24234,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     from tools.terminal_tool import register_task_env_overrides
 
                     register_task_env_overrides(session_id, {"cwd": _proj_cwd})
+                    # Also PERSIST it on the session row. _launch_cwd_for_session
+                    # only stamps cwd for source='cli', so a gateway session
+                    # would otherwise have cwd=NULL forever — and project
+                    # membership is resolved from cwd (project_for_path), so
+                    # without this a thread started in #proj-foo never links to
+                    # that project in /sessions project or the thread mirror.
+                    # update_session_cwd only writes non-empty values, so this
+                    # can't clobber a real cwd recorded by another surface.
+                    if self._session_db is not None:
+                        try:
+                            await asyncio.to_thread(
+                                getattr(
+                                    self._session_db, "_db", self._session_db
+                                ).update_session_cwd,
+                                session_id,
+                                _proj_cwd,
+                            )
+                        except Exception as _cwd_err:
+                            logger.debug(
+                                "project_channels: could not persist cwd: %s",
+                                _cwd_err,
+                            )
             except Exception as _pc_err:
                 logger.debug("project_channels: cwd binding skipped: %s", _pc_err)
 
